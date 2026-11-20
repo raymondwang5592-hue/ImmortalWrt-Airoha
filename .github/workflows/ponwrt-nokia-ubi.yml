@@ -1,0 +1,94 @@
+name: Build PonWrt for Nokia XG-040G-MD UBI
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      PROFILE: nokia_xg-040g-md-ubi
+      EXTRA_PACKAGES: luci-app-homeproxy sing-box luci-app-adblock-fast adblock-fast luci-app-nlbwmon nlbwmon
+      REQUIRED_PACKAGES: kmod-airoha-xpon kmod-airoha-pon-frontend airoha-ponctl airoha-pond luci-app-pon airoha-en7581-npu-firmware ppp ppp-mod-pppoe odhcp6c odhcpd-ipv6only firewall4 kmod-nft-tproxy kmod-nft-offload kmod-tun kmod-nf-conntrack-netlink
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: pbs05/ponwrt
+          # Upstream snapshot-20261116
+          ref: f6977f2947eb355b106470354feae3d14868fbdd
+          persist-credentials: false
+
+      - name: Prepare build runner
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf python3 \
+            python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+          df -h .
+
+      - name: Install PonWrt feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure Nokia UBI image
+        run: |
+          ./scripts/kconfig.pl + configs/an7581.config configs/release.config > .config
+          target="CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_$PROFILE=y"
+          grep -Fx "$target" .config
+          awk -v target="$target" '!/^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_[^=]+=y$/ || $0 == target' .config > config.selected
+          mv config.selected .config
+          for pkg in $EXTRA_PACKAGES; do
+            sed -i -e "/^CONFIG_PACKAGE_$pkg=/d" -e "/^# CONFIG_PACKAGE_$pkg is not set$/d" .config
+            printf 'CONFIG_PACKAGE_%s=y\n' "$pkg" >> .config
+          done
+          make defconfig
+          test "$(grep -E '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_[^=]+=y$' .config)" = "$target"
+          for pkg in $EXTRA_PACKAGES $REQUIRED_PACKAGES; do
+            grep -Fx "CONFIG_PACKAGE_$pkg=y" .config || { echo "::error::Missing built-in package: $pkg"; exit 1; }
+          done
+
+      - name: Download and compile
+        run: |
+          make download -j8
+          make -j"$(nproc)" || make -j1 V=s
+
+      - name: Verify and collect Nokia sysupgrade
+        run: |
+          output="$PWD/verified-firmware"
+          mkdir "$output"
+          cp .config "$output/build.config"
+          git rev-parse HEAD > "$output/source-commit.txt"
+          cd bin/targets/airoha/an7581
+          images=( *-"$PROFILE"-squashfs-sysupgrade.itb )
+          manifests=( *-"$PROFILE".manifest )
+          test "${#images[@]}" -eq 1 && test -s "${images[0]}"
+          test "${#manifests[@]}" -eq 1 && test -s "${manifests[0]}"
+          for pkg in $EXTRA_PACKAGES $REQUIRED_PACKAGES; do
+            awk -v p="$pkg" '$1 == p {found=1} END {exit !found}' "${manifests[0]}" || { echo "::error::Missing from manifest: $pkg"; exit 1; }
+          done
+          grep -E '^nftables(-json)? ' "${manifests[0]}"
+          cp "${images[0]}" "${manifests[0]}" "$output/"
+          cd "$output"
+          sha256sum "${images[0]}" "${manifests[0]}" > sha256sums
+          sha256sum -c sha256sums
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PonWrt-Nokia-XG-040G-MD-UBI
+          path: verified-firmware/
+          if-no-files-found: error
+          retention-days: 30
